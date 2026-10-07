@@ -166,17 +166,13 @@ impl Reverb {
             *rsample = 0_f32;
         }
 
-        for cf in self.cfs_l.iter_mut() {
-            cf.process(input, output_left);
-        }
+        CombFilter::process_bank(&mut self.cfs_l, input, output_left);
 
         for apf in self.apfs_l.iter_mut() {
             apf.process(output_left);
         }
 
-        for cf in self.cfs_r.iter_mut() {
-            cf.process(input, output_right);
-        }
+        CombFilter::process_bank(&mut self.cfs_r, input, output_right);
 
         for apf in self.apfs_r.iter_mut() {
             apf.process(output_right);
@@ -269,6 +265,63 @@ impl CombFilter {
         }
 
         self.filter_store = 0_f32;
+    }
+
+    /// Runs the eight comb filters of one channel in lockstep, one sample at a time.
+    ///
+    /// Each filter's damping state is a serial dependency, so running them one after another leaves the
+    /// CPU waiting on that chain. Interleaving eight independent chains hides the latency. Every filter
+    /// performs the same operations in the same order as `process`, and the outputs are summed in filter
+    /// order, so the result is bit-identical.
+    fn process_bank(cfs: &mut [CombFilter], input_block: &[f32], output_block: &mut [f32]) {
+        const N: usize = 8;
+        if cfs.len() != N {
+            for cf in cfs.iter_mut() {
+                cf.process(input_block, output_block);
+            }
+            return;
+        }
+        let cfs: &mut [CombFilter; N] = cfs.try_into().unwrap();
+
+        let len: [usize; N] = std::array::from_fn(|k| cfs[k].buffer.len());
+        let feedback: [f32; N] = std::array::from_fn(|k| cfs[k].feedback);
+        let damp1: [f32; N] = std::array::from_fn(|k| cfs[k].damp1);
+        let damp2: [f32; N] = std::array::from_fn(|k| cfs[k].damp2);
+        let mut store: [f32; N] = std::array::from_fn(|k| cfs[k].filter_store);
+        let mut index: [usize; N] = std::array::from_fn(|k| {
+            if cfs[k].buffer_index == len[k] {
+                0
+            } else {
+                cfs[k].buffer_index
+            }
+        });
+        let buffers = cfs.each_mut().map(|cf| cf.buffer.as_mut_slice());
+
+        for (&input, destination) in input_block.iter().zip(output_block.iter_mut()) {
+            let mut sum = *destination;
+            for k in 0..N {
+                let i = index[k];
+                let mut output = buffers[k][i];
+                if output.abs() < 1.0E-6_f32 {
+                    output = 0_f32;
+                }
+
+                store[k] = (output * damp2[k]) + (store[k] * damp1[k]);
+                if store[k].abs() < 1.0E-6_f32 {
+                    store[k] = 0_f32;
+                }
+
+                buffers[k][i] = input + (store[k] * feedback[k]);
+                sum += output;
+                index[k] = if i + 1 == len[k] { 0 } else { i + 1 };
+            }
+            *destination = sum;
+        }
+
+        for (k, cf) in cfs.iter_mut().enumerate() {
+            cf.filter_store = store[k];
+            cf.buffer_index = index[k];
+        }
     }
 
     fn process(&mut self, input_block: &[f32], output_block: &mut [f32]) {
@@ -387,5 +440,84 @@ impl AllPassFilter {
 
     fn set_feedback(&mut self, value: f32) {
         self.feedback = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{bits, Rng};
+
+    fn combs(lengths: &[usize], rng: &mut Rng) -> Vec<CombFilter> {
+        lengths
+            .iter()
+            .map(|&len| {
+                let mut cf = CombFilter::new(len);
+                cf.set_feedback(rng.range(0.7, 0.98));
+                cf.set_damp(rng.range(0.0, 0.4));
+                cf
+            })
+            .collect()
+    }
+
+    fn assert_bank_matches_one_by_one(lengths: &[usize], block: usize, seed: u64) {
+        let mut rng = Rng::new(seed);
+        let mut bank = combs(lengths, &mut rng);
+        let mut rng = Rng::new(seed);
+        let mut serial = combs(lengths, &mut rng);
+
+        for n in 0..200 {
+            // Silence stretches drive states below the denormal threshold, where the flush-to-zero
+            // branches kick in.
+            let input = if n % 50 > 40 {
+                vec![0_f32; block]
+            } else {
+                rng.block(block)
+            };
+            let mut out_bank = vec![0_f32; block];
+            let mut out_serial = vec![0_f32; block];
+            CombFilter::process_bank(&mut bank, &input, &mut out_bank);
+            for cf in serial.iter_mut() {
+                cf.process(&input, &mut out_serial);
+            }
+            assert_eq!(bits(&out_bank), bits(&out_serial), "block {n}");
+        }
+        for (a, b) in bank.iter().zip(&serial) {
+            assert_eq!(a.filter_store.to_bits(), b.filter_store.to_bits());
+            assert_eq!(bits(&a.buffer), bits(&b.buffer));
+            assert_eq!(
+                a.buffer_index % a.buffer.len(),
+                b.buffer_index % b.buffer.len()
+            );
+        }
+    }
+
+    #[test]
+    fn comb_bank_is_bit_identical_to_one_filter_at_a_time() {
+        let freeverb = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+        assert_bank_matches_one_by_one(&freeverb, 64, 1);
+    }
+
+    #[test]
+    fn comb_bank_handles_several_wraps_per_block() {
+        // Buffers shorter than the block wrap more than once per call (low sample rates).
+        assert_bank_matches_one_by_one(&[7, 13, 29, 31, 64, 65, 100, 3], 128, 2);
+        assert_bank_matches_one_by_one(&[1, 2, 3, 4, 5, 6, 7, 8], 64, 3);
+    }
+
+    #[test]
+    fn comb_bank_falls_back_for_other_filter_counts() {
+        assert_bank_matches_one_by_one(&[1116, 1188, 1277], 64, 4);
+    }
+
+    #[test]
+    fn reverb_at_other_sample_rates_matches_serial_combs() {
+        for rate in [16_000, 22_050, 44_100, 48_000, 96_000] {
+            let lengths: Vec<usize> = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617]
+                .iter()
+                .map(|&t| Reverb::scale_tuning(rate, t))
+                .collect();
+            assert_bank_matches_one_by_one(&lengths, 64, rate as u64);
+        }
     }
 }
