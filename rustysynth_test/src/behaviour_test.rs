@@ -94,6 +94,77 @@ fn synthetic(frames: u32, region: Region) -> Result<Arc<SoundFont>, SoundFontErr
 const HALF_SECOND: u32 = SAMPLE_RATE as u32 / 2;
 
 #[test]
+fn empty_instruments_keep_their_indices_and_render_silence() {
+    // Empty instruments before and after a playable instrument, including adjacent empties.
+    // Every preset refers to its original instrument table index.
+    let bytes = synthetic_sf2_with_instrument_bags(
+        HALF_SECOND,
+        &Region {
+            sample_modes: 0,
+            start_loop: 0,
+            end_loop: 0,
+            end: None,
+        },
+        &[0, 0, 0, 1, 1, 1],
+    );
+    let path = std::env::temp_dir().join(format!(
+        "rustysynth-empty-instruments-{}.sf2",
+        std::process::id()
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let loaded = SoundFont::new(&mut Cursor::new(&bytes));
+    let mapped = SoundFont::new_mmap(&std::fs::File::open(&path).unwrap());
+
+    for sf in [loaded, mapped] {
+        let sf = Arc::new(sf.unwrap());
+        assert_eq!(sf.get_instruments().len(), 5);
+        assert_eq!(sf.get_presets().len(), 5);
+        for id in 0..5 {
+            let instrument = &sf.get_instruments()[id];
+            assert_eq!(instrument.get_name(), format!("instrument {id}"));
+            assert_eq!(instrument.get_regions().len(), usize::from(id == 2));
+            assert_eq!(
+                sf.get_presets()[id].get_regions()[0].get_instrument_id(),
+                id
+            );
+            let out = render(
+                &sf,
+                &midi(vec![
+                    Event(0, [0xC0, id as u8, 0]),
+                    Event(1, [0x90, 69, 100]),
+                    Event(TICKS_PER_SECOND / 2, [0x80, 69, 0]),
+                ]),
+                1.0,
+            );
+            if id == 2 {
+                assert!(out.energy(0.1, 0.4) > 1e-4, "playable instrument shifted");
+            } else {
+                assert_eq!(out.peak(), 0.0, "empty instrument {id} must be silent");
+            }
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn reversed_instrument_bag_indices_are_still_rejected() {
+    let bytes = synthetic_sf2_with_instrument_bags(
+        HALF_SECOND,
+        &Region {
+            sample_modes: 0,
+            start_loop: 0,
+            end_loop: 0,
+            end: None,
+        },
+        &[1, 0, 1],
+    );
+    assert!(matches!(
+        SoundFont::new(&mut Cursor::new(bytes)),
+        Err(SoundFontError::InvalidInstrument(0))
+    ));
+}
+
+#[test]
 fn valid_loop_sustains_a_held_note() {
     let sf = synthetic(
         HALF_SECOND,

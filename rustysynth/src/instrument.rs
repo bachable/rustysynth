@@ -24,8 +24,17 @@ impl Instrument {
         let name = info.name.clone();
 
         let zone_count = info.zone_end_index - info.zone_start_index + 1;
-        if zone_count <= 0 {
+        if zone_count < 0 {
             return Err(SoundFontError::InvalidInstrument(instrument_id));
+        }
+        if zone_count == 0 {
+            // Some SoundFonts retain empty, zero-zone instruments (e.g. HeartBeat in
+            // Timbres of Heaven XGM4). Keep their indices so preset references remain
+            // valid; an instrument without regions simply produces no voices.
+            return Ok(Self {
+                name,
+                regions: Vec::new(),
+            });
         }
 
         let span_start = info.zone_start_index as usize;
