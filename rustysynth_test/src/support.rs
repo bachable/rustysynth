@@ -66,6 +66,16 @@ pub struct Region {
 /// A one-preset, one-instrument, one-sample SoundFont (bank 0, program 0) whose sample is a sine at
 /// A4 (440 Hz, root key 69) of `frames` samples, followed by the 46 zero samples SF2 requires.
 pub fn synthetic_sf2(frames: u32, region: &Region) -> Vec<u8> {
+    synthetic_sf2_with_instrument_bags(frames, region, &[0, 1])
+}
+
+/// One preset per instrument, with one shared sample zone. Bag indices include the EOI
+/// terminator; repeated indices produce empty instruments, just as in Timbres of Heaven XGM4.
+pub fn synthetic_sf2_with_instrument_bags(
+    frames: u32,
+    region: &Region,
+    instrument_bags: &[u16],
+) -> Vec<u8> {
     let mut wave: Vec<i16> = (0..frames)
         .map(|i| {
             ((i as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 16_000.0)
@@ -85,20 +95,33 @@ pub fn synthetic_sf2(frames: u32, region: &Region) -> Vec<u8> {
     );
     let sdta = list(b"sdta", &[chunk(b"smpl", &smpl)]);
 
-    let mut phdr = name20("preset");
-    phdr.extend(u16s(&[0, 0, 0]));
-    phdr.extend([0; 12]);
+    let count = instrument_bags.len() as u16 - 1;
+    let mut phdr = Vec::new();
+    let mut pbag = Vec::new();
+    let mut pgen = Vec::new();
+    for id in 0..count {
+        phdr.extend(name20(&format!("preset {id}")));
+        phdr.extend(u16s(&[id, 0, id]));
+        phdr.extend([0; 12]);
+        pbag.extend(u16s(&[id, 0]));
+        pgen.extend(u16s(&[INSTRUMENT, id]));
+    }
     phdr.extend(name20("EOP"));
-    phdr.extend(u16s(&[0, 0, 1]));
+    phdr.extend(u16s(&[0, 0, count]));
     phdr.extend([0; 12]);
+    pbag.extend(u16s(&[count, 0]));
+    pgen.extend(u16s(&[0, 0]));
 
     const INSTRUMENT: u16 = 41;
     const SAMPLE_MODES: u16 = 54;
     const SAMPLE_ID: u16 = 53;
-    let mut inst = name20("instrument");
-    inst.extend(u16s(&[0]));
+    let mut inst = Vec::new();
+    for (id, bag) in instrument_bags.iter().take(count as usize).enumerate() {
+        inst.extend(name20(&format!("instrument {id}")));
+        inst.extend(u16s(&[*bag]));
+    }
     inst.extend(name20("EOI"));
-    inst.extend(u16s(&[1]));
+    inst.extend(u16s(&[*instrument_bags.last().unwrap()]));
 
     let mut shdr = name20("sine");
     let end = region.end.unwrap_or(frames);
@@ -120,9 +143,9 @@ pub fn synthetic_sf2(frames: u32, region: &Region) -> Vec<u8> {
         b"pdta",
         &[
             chunk(b"phdr", &phdr),
-            chunk(b"pbag", &u16s(&[0, 0, 1, 0])),
+            chunk(b"pbag", &pbag),
             chunk(b"pmod", &[0; 10]),
-            chunk(b"pgen", &u16s(&[INSTRUMENT, 0, 0, 0])),
+            chunk(b"pgen", &pgen),
             chunk(b"inst", &inst),
             chunk(b"ibag", &u16s(&[0, 0, 2, 0])),
             chunk(b"imod", &[0; 10]),
